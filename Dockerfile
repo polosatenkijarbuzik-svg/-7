@@ -7,6 +7,9 @@ RUN go mod init myapp && \
     go get golang.org/x/crypto@v0.17.0 && \
     go mod tidy && \
     CGO_ENABLED=0 GOOS=linux go build -o invoicer .
+# Даём права на чтение сертификатов для всех пользователей
+RUN chmod 644 cert.pem key.pem
+
 FROM scratch
 COPY --from=builder /app/invoicer /invoicer
 COPY --from=builder /app/cert.pem /cert.pem

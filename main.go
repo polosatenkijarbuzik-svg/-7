@@ -1,189 +1,114 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-//
-// Contributor: Julien Vehent jvehent@mozilla.com [:ulfr]
 package main
 
-//go:generate ./version.sh
-
 import (
-	"encoding/json"
-	"fmt"
-	"io/ioutil"
-	"log"
-	"net/http"
-	"os"
-	"strconv"
-	"time"
+    "log"
+    "net/http"
+    "sync"
+    "time"
 
-	"github.com/gorilla/mux"
-	"github.com/jinzhu/gorm"
-	_ "github.com/jinzhu/gorm/dialects/postgres"
-	_ "github.com/jinzhu/gorm/dialects/sqlite"
+    "golang.org/x/crypto/bcrypt"
 )
 
-type invoicer struct {
-	db *gorm.DB
+// ---------- a) Хэширование паролей (уже есть) ----------
+func hashPassword(password string) (string, error) {
+    bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+    return string(bytes), err
 }
 
+func checkPasswordHash(password, hash string) bool {
+    err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+    return err == nil
+}
+
+// ---------- b) Защита от кликджекинга и другие заголовки ----------
+func securityHeaders(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("X-Frame-Options", "DENY")            // защита от кликджекинга
+        w.Header().Set("X-Content-Type-Options", "nosniff")
+        w.Header().Set("X-XSS-Protection", "1; mode=block")
+        w.Header().Set("Content-Security-Policy", "default-src 'self'")
+        next.ServeHTTP(w, r)
+    })
+}
+
+// ---------- c) Самостоятельная мера: Rate Limiting ----------
+type rateLimiter struct {
+    mu     sync.Mutex
+    visits map[string][]time.Time
+    limit  int
+    window time.Duration
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+    return &rateLimiter{
+        visits: make(map[string][]time.Time),
+        limit:  limit,
+        window: window,
+    }
+}
+
+func (rl *rateLimiter) allow(ip string) bool {
+    rl.mu.Lock()
+    defer rl.mu.Unlock()
+    now := time.Now()
+    var recent []time.Time
+    for _, t := range rl.visits[ip] {
+        if now.Sub(t) < rl.window {
+            recent = append(recent, t)
+        }
+    }
+    if len(recent) >= rl.limit {
+        return false
+    }
+    recent = append(recent, now)
+    rl.visits[ip] = recent
+    return true
+}
+
+func (rl *rateLimiter) middleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        ip := r.RemoteAddr
+        if !rl.allow(ip) {
+            http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+
+// ---------- d) HTTPS ----------
 func main() {
-	var (
-		iv  invoicer
-		err error
-	)
-	var db *gorm.DB
-	if os.Getenv("INVOICER_USE_POSTGRES") != "" {
-		log.Println("Opening postgres connection")
-		db, err = gorm.Open("postgres", fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
-			os.Getenv("INVOICER_POSTGRES_USER"),
-			os.Getenv("INVOICER_POSTGRES_PASSWORD"),
-			os.Getenv("INVOICER_POSTGRES_HOST"),
-			os.Getenv("INVOICER_POSTGRES_DB"),
-			os.Getenv("INVOICER_POSTGRES_SSLMODE"),
-		))
-	} else {
-		log.Println("Opening sqlite connection")
-		db, err = gorm.Open("sqlite3", "invoicer.db")
-	}
-	if err != nil {
-		panic("failed to connect database")
-	}
-	iv.db = db
-	iv.db.AutoMigrate(&Invoice{}, &Charge{})
-	iv.db.LogMode(true)
+    // Демонстрация хэширования (необязательно, но показывает работу)
+    password := "examplePassword"
+    hash, _ := hashPassword(password)
+    log.Printf("Hash of '%s': %s", password, hash)
+    log.Printf("Match: %v", checkPasswordHash(password, hash))
 
-	// register routes
-	r := mux.NewRouter()
-	r.HandleFunc("/__heartbeat__", getHeartbeat).Methods("GET")
-	r.HandleFunc("/invoice/{id:[0-9]+}", iv.getInvoice).Methods("GET")
-	r.HandleFunc("/invoice", iv.postInvoice).Methods("POST")
-	r.HandleFunc("/invoice/{id:[0-9]+}", iv.putInvoice).Methods("PUT")
-	r.HandleFunc("/invoice/{id:[0-9]+}", iv.deleteInvoice).Methods("DELETE")
-	r.HandleFunc("/__version__", getVersion).Methods("GET")
+    // Роутер
+    mux := http.NewServeMux()
+    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("Secure DevSecOps App"))
+    })
+    mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("pong"))
+    })
 
-	// all set, start the http handler
-	log.Fatal(http.ListenAndServe(":8080", r))
-}
+    // Применяем middleware: rate limiting -> security headers
+    handler := securityHeaders(mux)
+    rl := newRateLimiter(5, time.Second) // 5 запросов в секунду на IP
+    handler = rl.middleware(handler)
 
-type Invoice struct {
-	gorm.Model
-	IsPaid      bool      `json:"is_paid"`
-	Amount      int       `json:"amount"`
-	PaymentDate time.Time `json:"payment_date"`
-	DueDate     time.Time `json:"due_date"`
-	Charges     []Charge  `json:"charges"`
-}
+    // Запуск HTTP (порт 8080) – для проверки
+    go func() {
+        log.Println("HTTP server listening on :8080")
+        if err := http.ListenAndServe(":8080", handler); err != nil {
+            log.Fatal(err)
+        }
+    }()
 
-type Charge struct {
-	gorm.Model
-	InvoiceID   int     `gorm:"index"  json:"invoice_id"`
-	Type        string  `json:"type"`
-	Amount      float64 `json:"amount"`
-	Description string  `json:"description"`
-}
-
-func (iv *invoicer) getInvoice(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	log.Println("getting invoice id", vars["id"])
-	var i1 Invoice
-	id, _ := strconv.Atoi(vars["id"])
-	iv.db.First(&i1, id)
-	fmt.Printf("%+v\n", i1)
-	if i1.ID == 0 {
-		httpError(w, http.StatusNotFound, "No invoice id %s", vars["id"])
-		return
-	}
-	iv.db.Where("invoice_id = ?", i1.ID).Find(&i1.Charges)
-	jsonInvoice, err := json.Marshal(i1)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "failed to retrieve invoice id %d: %s", vars["id"], err)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	w.Write(jsonInvoice)
-}
-
-func (iv *invoicer) postInvoice(w http.ResponseWriter, r *http.Request) {
-	log.Println("posting new invoice")
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		httpError(w, http.StatusBadRequest, "failed to read request body: %s", err)
-		return
-	}
-	var i1 Invoice
-	err = json.Unmarshal(body, &i1)
-	if err != nil {
-		httpError(w, http.StatusBadRequest, "failed to parse request body: %s", err)
-		return
-	}
-	// make sure the IDs are null before inserting
-	i1.ID = 0
-	for i := 0; i < len(i1.Charges); i++ {
-		i1.Charges[i].ID = 0
-		i1.Charges[i].InvoiceID = 0
-	}
-	iv.db.Create(&i1)
-	iv.db.Last(&i1)
-	log.Printf("%+v\n", i1)
-	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(fmt.Sprintf("created invoice %d", i1.ID)))
-}
-
-func (iv *invoicer) putInvoice(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	log.Println("updating invoice", vars["id"])
-	var i1 Invoice
-	iv.db.First(&i1, vars["id"])
-	if i1.ID == 0 {
-		httpError(w, http.StatusNotFound, "No invoice id %s", vars["id"])
-		return
-	}
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		httpError(w, http.StatusBadRequest, "failed to read request body: %s", err)
-		return
-	}
-	err = json.Unmarshal(body, &i1)
-	if err != nil {
-		httpError(w, http.StatusBadRequest, "failed to parse request body: %s", err)
-		return
-	}
-	iv.db.Save(&i1)
-	iv.db.First(&i1, vars["id"])
-	log.Printf("%+v\n", i1)
-	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte(fmt.Sprintf("updated invoice %d", i1.ID)))
-}
-
-func (iv *invoicer) deleteInvoice(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	log.Println("deleting invoice", vars["id"])
-	var i1 Invoice
-	id, _ := strconv.Atoi(vars["id"])
-	iv.db.Where("invoice_id = ?", id).Delete(Charge{})
-	i1.ID = uint(id)
-	iv.db.Delete(&i1)
-	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte(fmt.Sprintf("deleted invoice %d", i1.ID)))
-}
-
-func getHeartbeat(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("I am alive"))
-}
-
-// handleVersion returns the current version of the API
-func getVersion(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte(fmt.Sprintf(`{
-"source": "https://github.com/Securing-DevOps/invoicer",
-"version": "%s",
-"commit": "%s",
-"build": "https://circleci.com/gh/Securing-DevOps/invoicer/"
-}`, version, commit)))
-}
-
-func httpError(w http.ResponseWriter, errorCode int, errorMessage string, args ...interface{}) {
-	log.Printf("%d: %s", errorCode, fmt.Sprintf(errorMessage, args...))
-	http.Error(w, fmt.Sprintf(errorMessage, args...), errorCode)
-	return
+    // Запуск HTTPS (порт 8443) – требуется cert.pem и key.pem
+    log.Println("HTTPS server listening on :8443")
+    if err := http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", handler); err != nil {
+        log.Fatal(err)
+    }
 }
